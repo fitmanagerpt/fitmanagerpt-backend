@@ -1,0 +1,6 @@
+.env
+fitmanager.db
+__pycache__/
+*.pyc
+.venv/
+venv/
