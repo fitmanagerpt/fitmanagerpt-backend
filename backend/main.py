@@ -12,7 +12,15 @@ from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
 
 from .database import Base, engine, get_db
-from .models import User, TrainerProfile, StudentProfile, PasswordResetToken
+from .models import (
+    User,
+    TrainerProfile,
+    StudentProfile,
+    PasswordResetToken,
+    Lesson,
+    LessonEnrollment,
+    StudentProgress,
+)
 from .schemas import (
     UserCreate,
     UserResponse,
@@ -20,6 +28,11 @@ from .schemas import (
     ForgotPasswordRequest,
     ResetPasswordRequest,
     ChangePasswordRequest,
+    LessonCreate,
+    LessonEnrollRequest,
+    StudentBodyProfileUpdate,
+    StudentBodyProfileResponse,
+    StudentProgressCreate,
 )
 from .auth import (
     hash_password,
@@ -54,6 +67,60 @@ def generate_trainer_code(db: Session):
         exists = db.query(TrainerProfile).filter(TrainerProfile.trainer_code == code).first()
         if not exists:
             return code
+
+
+def parse_iso_datetime(value: str) -> datetime:
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        raise HTTPException(status_code=400, detail="Data/hora inválida")
+
+
+def calculate_bmi(weight_kg: float | None, height_cm: float | None):
+    if not weight_kg or not height_cm or height_cm <= 0:
+        return None
+    height_m = height_cm / 100
+    return round(weight_kg / (height_m * height_m), 2)
+
+
+def build_lesson_response(lesson: Lesson, student_profile: StudentProfile | None = None):
+    is_enrolled = False
+    can_watch_video = False
+
+    if student_profile:
+        enrollment = next(
+            (e for e in lesson.enrollments if e.student_id == student_profile.id),
+            None,
+        )
+        is_enrolled = enrollment is not None
+
+        now = datetime.now(timezone.utc)
+        scheduled_at = lesson.scheduled_at
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+
+        can_watch_video = (
+            lesson.lesson_type == "online"
+            and is_enrolled
+            and now >= scheduled_at
+        )
+
+    return {
+        "id": lesson.id,
+        "title": lesson.title,
+        "description": lesson.description,
+        "scheduledat": lesson.scheduled_at.isoformat(),
+        "lessontype": lesson.lesson_type,
+        "location": lesson.location,
+        "videolink": lesson.video_link,
+        "videouploadname": lesson.video_upload_name,
+        "enrolledcount": len(lesson.enrollments),
+        "isenrolled": is_enrolled,
+        "canwatchvideo": can_watch_video,
+    }
 
 
 @app.post("/register", response_model=UserResponse)
@@ -232,13 +299,379 @@ def my_students(
     for student in students:
         user = db.query(User).filter(User.id == student.user_id).first()
         if user:
+            current_weight = (
+                db.query(StudentProgress)
+                .filter(StudentProgress.student_id == student.id)
+                .order_by(StudentProgress.created_at.desc())
+                .first()
+            )
             result.append({
                 "id": user.id,
                 "username": user.username,
                 "email": user.email,
+                "height_cm": student.height_cm,
+                "initial_weight_kg": student.initial_weight_kg,
+                "current_weight_kg": current_weight.weight_kg if current_weight else student.initial_weight_kg,
+                "bmi": calculate_bmi(
+                    current_weight.weight_kg if current_weight else student.initial_weight_kg,
+                    student.height_cm,
+                ),
             })
 
     return result
+
+
+@app.post("/trainer-lessons")
+def create_lesson(
+    data: LessonCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.tipo != "treinador":
+        raise HTTPException(status_code=403, detail="Só treinadores podem criar aulas")
+
+    trainer_profile = db.query(TrainerProfile).filter(
+        TrainerProfile.user_id == current_user.id
+    ).first()
+
+    if not trainer_profile:
+        raise HTTPException(status_code=404, detail="Trainer não encontrado")
+
+    if data.lesson_type not in ["online", "presencial"]:
+        raise HTTPException(status_code=400, detail="Tipo de aula inválido")
+
+    if data.lesson_type == "presencial" and not data.location:
+        raise HTTPException(status_code=400, detail="Indica o local da aula presencial")
+
+    scheduled_at = parse_iso_datetime(data.scheduled_at)
+
+    lesson = Lesson(
+        trainer_id=trainer_profile.id,
+        title=data.title.strip(),
+        description=(data.description or "").strip(),
+        scheduled_at=scheduled_at,
+        lesson_type=data.lesson_type,
+        location=(data.location or "").strip() or None,
+        video_link=(data.video_link or "").strip() or None,
+        video_upload_name=(data.video_upload_name or "").strip() or None,
+    )
+    db.add(lesson)
+    db.commit()
+    db.refresh(lesson)
+
+    return {"message": "Aula criada com sucesso", "id": lesson.id}
+
+
+@app.get("/trainer-lessons")
+def get_trainer_lessons(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.tipo != "treinador":
+        raise HTTPException(status_code=403, detail="Só treinadores podem ver as suas aulas")
+
+    trainer_profile = db.query(TrainerProfile).filter(
+        TrainerProfile.user_id == current_user.id
+    ).first()
+
+    if not trainer_profile:
+        return []
+
+    lessons = (
+        db.query(Lesson)
+        .filter(Lesson.trainer_id == trainer_profile.id, Lesson.is_active == True)
+        .order_by(Lesson.scheduled_at.asc())
+        .all()
+    )
+
+    return [build_lesson_response(lesson) for lesson in lessons]
+
+
+@app.get("/student-lessons")
+def get_student_lessons(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.tipo != "aluno":
+        raise HTTPException(status_code=403, detail="Só alunos podem ver aulas")
+
+    student_profile = db.query(StudentProfile).filter(
+        StudentProfile.user_id == current_user.id
+    ).first()
+
+    if not student_profile or not student_profile.trainer_id:
+        return []
+
+    lessons = (
+        db.query(Lesson)
+        .filter(Lesson.trainer_id == student_profile.trainer_id, Lesson.is_active == True)
+        .order_by(Lesson.scheduled_at.asc())
+        .all()
+    )
+
+    return [build_lesson_response(lesson, student_profile) for lesson in lessons]
+
+
+@app.post("/enroll-lesson")
+def enroll_lesson(
+    data: LessonEnrollRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.tipo != "aluno":
+        raise HTTPException(status_code=403, detail="Só alunos podem inscrever-se em aulas")
+
+    student_profile = db.query(StudentProfile).filter(
+        StudentProfile.user_id == current_user.id
+    ).first()
+
+    if not student_profile or not student_profile.trainer_id:
+        raise HTTPException(status_code=400, detail="Aluno sem trainer associado")
+
+    lesson = db.query(Lesson).filter(Lesson.id == data.lesson_id, Lesson.is_active == True).first()
+
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Aula não encontrada")
+
+    if lesson.trainer_id != student_profile.trainer_id:
+        raise HTTPException(status_code=403, detail="Só te podes inscrever em aulas do teu trainer")
+
+    existing = db.query(LessonEnrollment).filter(
+        LessonEnrollment.lesson_id == lesson.id,
+        LessonEnrollment.student_id == student_profile.id,
+    ).first()
+
+    if existing:
+        raise HTTPException(status_code=400, detail="Já estás inscrito nesta aula")
+
+    enrollment = LessonEnrollment(
+        lesson_id=lesson.id,
+        student_id=student_profile.id,
+        status="inscrito",
+    )
+    db.add(enrollment)
+    db.commit()
+
+    return {"message": "Inscrição feita com sucesso"}
+
+
+@app.get("/student-body-profile", response_model=StudentBodyProfileResponse)
+def get_student_body_profile(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.tipo != "aluno":
+        raise HTTPException(status_code=403, detail="Só alunos podem ver o próprio perfil corporal")
+
+    student_profile = db.query(StudentProfile).filter(
+        StudentProfile.user_id == current_user.id
+    ).first()
+
+    if not student_profile:
+        student_profile = StudentProfile(user_id=current_user.id)
+        db.add(student_profile)
+        db.commit()
+        db.refresh(student_profile)
+
+    latest_progress = (
+        db.query(StudentProgress)
+        .filter(StudentProgress.student_id == student_profile.id)
+        .order_by(StudentProgress.created_at.desc())
+        .first()
+    )
+
+    current_weight = latest_progress.weight_kg if latest_progress else student_profile.initial_weight_kg
+
+    return {
+        "height_cm": student_profile.height_cm,
+        "initial_weight_kg": student_profile.initial_weight_kg,
+        "goal": student_profile.goal,
+        "injuries": student_profile.injuries,
+        "weekly_availability": student_profile.weekly_availability,
+        "current_weight_kg": current_weight,
+        "bmi": calculate_bmi(current_weight, student_profile.height_cm),
+    }
+
+
+@app.put("/student-body-profile", response_model=StudentBodyProfileResponse)
+def update_student_body_profile(
+    data: StudentBodyProfileUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.tipo != "aluno":
+        raise HTTPException(status_code=403, detail="Só alunos podem atualizar o próprio perfil corporal")
+
+    student_profile = db.query(StudentProfile).filter(
+        StudentProfile.user_id == current_user.id
+    ).first()
+
+    if not student_profile:
+        student_profile = StudentProfile(user_id=current_user.id)
+        db.add(student_profile)
+        db.commit()
+        db.refresh(student_profile)
+
+    student_profile.height_cm = data.height_cm
+    student_profile.initial_weight_kg = data.initial_weight_kg
+    student_profile.goal = data.goal
+    student_profile.injuries = data.injuries
+    student_profile.weekly_availability = data.weekly_availability
+    db.commit()
+    db.refresh(student_profile)
+
+    latest_progress = (
+        db.query(StudentProgress)
+        .filter(StudentProgress.student_id == student_profile.id)
+        .order_by(StudentProgress.created_at.desc())
+        .first()
+    )
+
+    current_weight = latest_progress.weight_kg if latest_progress else student_profile.initial_weight_kg
+
+    return {
+        "height_cm": student_profile.height_cm,
+        "initial_weight_kg": student_profile.initial_weight_kg,
+        "goal": student_profile.goal,
+        "injuries": student_profile.injuries,
+        "weekly_availability": student_profile.weekly_availability,
+        "current_weight_kg": current_weight,
+        "bmi": calculate_bmi(current_weight, student_profile.height_cm),
+    }
+
+
+@app.post("/student-progress")
+def add_student_progress(
+    data: StudentProgressCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.tipo != "aluno":
+        raise HTTPException(status_code=403, detail="Só alunos podem registar progresso")
+
+    if data.weight_kg <= 0:
+        raise HTTPException(status_code=400, detail="Peso inválido")
+
+    student_profile = db.query(StudentProfile).filter(
+        StudentProfile.user_id == current_user.id
+    ).first()
+
+    if not student_profile:
+        student_profile = StudentProfile(user_id=current_user.id)
+        db.add(student_profile)
+        db.commit()
+        db.refresh(student_profile)
+
+    progress = StudentProgress(
+        student_id=student_profile.id,
+        weight_kg=data.weight_kg,
+        week_label=(data.week_label or "").strip() or None,
+        notes=(data.notes or "").strip() or None,
+    )
+    db.add(progress)
+    db.commit()
+    db.refresh(progress)
+
+    return {
+        "message": "Progresso registado com sucesso",
+        "id": progress.id,
+        "bmi": calculate_bmi(progress.weight_kg, student_profile.height_cm),
+    }
+
+
+@app.get("/student-progress")
+def get_student_progress(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.tipo != "aluno":
+        raise HTTPException(status_code=403, detail="Só alunos podem ver o próprio progresso")
+
+    student_profile = db.query(StudentProfile).filter(
+        StudentProfile.user_id == current_user.id
+    ).first()
+
+    if not student_profile:
+        return []
+
+    progress_entries = (
+        db.query(StudentProgress)
+        .filter(StudentProgress.student_id == student_profile.id)
+        .order_by(StudentProgress.created_at.asc())
+        .all()
+    )
+
+    return [
+        {
+            "id": item.id,
+            "weight_kg": item.weight_kg,
+            "week_label": item.week_label,
+            "notes": item.notes,
+            "created_at": item.created_at.isoformat() if item.created_at else "",
+            "bmi": calculate_bmi(item.weight_kg, student_profile.height_cm),
+        }
+        for item in progress_entries
+    ]
+
+
+@app.get("/trainer-student-progress/{student_user_id}")
+def get_trainer_student_progress(
+    student_user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.tipo != "treinador":
+        raise HTTPException(status_code=403, detail="Só treinadores podem ver progresso dos alunos")
+
+    trainer_profile = db.query(TrainerProfile).filter(
+        TrainerProfile.user_id == current_user.id
+    ).first()
+
+    if not trainer_profile:
+        raise HTTPException(status_code=404, detail="Trainer não encontrado")
+
+    student_user = db.query(User).filter(User.id == student_user_id, User.tipo == "aluno").first()
+
+    if not student_user:
+        raise HTTPException(status_code=404, detail="Aluno não encontrado")
+
+    student_profile = db.query(StudentProfile).filter(
+        StudentProfile.user_id == student_user.id,
+        StudentProfile.trainer_id == trainer_profile.id,
+    ).first()
+
+    if not student_profile:
+        raise HTTPException(status_code=403, detail="Este aluno não está associado a ti")
+
+    progress_entries = (
+        db.query(StudentProgress)
+        .filter(StudentProgress.student_id == student_profile.id)
+        .order_by(StudentProgress.created_at.asc())
+        .all()
+    )
+
+    current_weight = progress_entries[-1].weight_kg if progress_entries else student_profile.initial_weight_kg
+
+    return {
+        "student_id": student_user.id,
+        "username": student_user.username,
+        "email": student_user.email,
+        "height_cm": student_profile.height_cm,
+        "initial_weight_kg": student_profile.initial_weight_kg,
+        "current_weight_kg": current_weight,
+        "bmi": calculate_bmi(current_weight, student_profile.height_cm),
+        "progress": [
+            {
+                "id": item.id,
+                "weight_kg": item.weight_kg,
+                "week_label": item.week_label,
+                "notes": item.notes,
+                "created_at": item.created_at.isoformat() if item.created_at else "",
+                "bmi": calculate_bmi(item.weight_kg, student_profile.height_cm),
+            }
+            for item in progress_entries
+        ],
+    }
 
 
 @app.post("/forgot-password")
